@@ -1,5 +1,5 @@
+streamlit==1.19.0
 pandas
-streamlit
-openpyxl
-altair
 numpy
+openpyxl
+altair==4.2.2
