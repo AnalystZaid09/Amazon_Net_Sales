@@ -2,75 +2,92 @@ import streamlit as st
 import pandas as pd
 import io
 
-# Allow large dataframes to be styled without hitting the cell limit
-pd.set_option("styler.render.max_elements", 2_000_000)
+# Allow large dataframes to be styled without hitting the default 262144-cell cap
+pd.set_option("styler.render.max_elements", 10_000_000)
 
-st.set_page_config(page_title="Net Sale Analyzer", page_icon="📦", layout="wide")
+st.set_page_config(page_title="Net Sale Dashboard", page_icon="📦", layout="wide")
 
-st.title("📦 Amazon Net Sale Analyzer")
-st.markdown("Upload your **Unified Transaction CSV** and **Product Master Excel** to generate the sales report.")
+st.title("📦 Amazon Net Sale Dashboard")
+st.markdown("Upload your transaction CSV and PM Excel file to generate the sales report.")
 
-# ── File Uploaders ────────────────────────────────────────────────────────────
-col1, col2 = st.columns(2)
-with col1:
-    txn_file = st.file_uploader(
-        "Upload Unified Transaction CSV",
+# ── Sidebar: File Uploads ────────────────────────────────────────────────────
+with st.sidebar:
+    st.header("📂 Upload Files")
+    csv_file = st.file_uploader(
+        "Transaction CSV (header at row 12)",
         type=["csv"],
-        help="The monthly transaction file (header starts at row 12, i.e. header=11)",
+        help="Amazon Unified Transaction report CSV"
     )
-with col2:
     pm_file = st.file_uploader(
-        "Upload Product Master Excel (PM.xlsx)",
+        "PM Excel (Purchase Master)",
         type=["xlsx", "xls"],
+        help="Purchase Master with SKU → ASIN mapping"
+    )
+    refund_file = st.file_uploader(
+        "Refund CSV (header at row 12)",
+        type=["csv"],
+        help="Refund / full-period transaction CSV"
     )
 
-# ── Processing ────────────────────────────────────────────────────────────────
-if txn_file and pm_file:
-    with st.spinner("Processing data…"):
+# ── Helper ───────────────────────────────────────────────────────────────────
+def fmt(val):
+    try:
+        return f"₹{val:,.2f}"
+    except Exception:
+        return val
 
-        # Load transaction CSV
-        df = pd.read_csv(txn_file, header=11)
+
+def highlight_profit(val):
+    color = "#d4edda" if val >= 0 else "#f8d7da"
+    return f"background-color: {color}"
+
+
+# ── Main Pipeline ────────────────────────────────────────────────────────────
+if csv_file and pm_file and refund_file:
+
+    # ── Step 1-6: Load & filter orders ──────────────────────────────────────
+    with st.spinner("Loading transaction data…"):
+        df = pd.read_csv(csv_file, header=11, low_memory=False)
         netsale = df.copy()
-
-        # Keep only Orders
         netsale = netsale[netsale["type"] == "Order"]
-
-        # Clean product sales
         netsale["product sales"] = pd.to_numeric(netsale["product sales"], errors="coerce")
         netsale = netsale[netsale["product sales"] != 0]
-
-        # Sort by order id
         netsale = netsale.sort_values(by="order id", ascending=True).reset_index(drop=True)
 
-        # Load PM
+    # ── Step 7-10: Load PM & map ASIN ───────────────────────────────────────
+    with st.spinner("Loading purchase master…"):
         pm = pd.read_excel(pm_file)
-
-        # Clean SKU columns
         netsale["Sku"] = netsale["Sku"].astype(str).str.strip()
         pm["Amazon Sku Name"] = pm["Amazon Sku Name"].astype(str).str.strip()
-
-        # Map ASIN
         asin_map = dict(zip(pm["Amazon Sku Name"], pm["ASIN"]))
         netsale["ASIN"] = netsale["Sku"].map(asin_map)
 
-        # Lowercase columns
-        netsale.columns = netsale.columns.str.lower()
-        pm.columns = pm.columns.str.lower()
+    # ── Step 11: Lower-case columns ──────────────────────────────────────────
+    netsale.columns = netsale.columns.str.lower()
+    pm.columns = pm.columns.str.lower()
 
-        # Merge PM lookup
-        pm_lookup = pm.iloc[:, [0, 4, 6, 9]]
-        pm_lookup.columns = ["asin", "brand manager", "brand", "cp"]
-        netsale = netsale.merge(pm_lookup, on="asin", how="left")
+    # ── Step 12: Map brand manager, brand, cp ────────────────────────────────
+    pm_lookup = pm.iloc[:, [0, 4, 6, 9]].copy()
+    pm_lookup.columns = ["asin", "brand manager", "brand", "cp"]
+    # Drop duplicate ASINs so set_index produces a unique index
+    pm_lookup = pm_lookup.drop_duplicates(subset="asin")
+    brand_manager_map = pm_lookup.set_index("asin")["brand manager"]
+    brand_map         = pm_lookup.set_index("asin")["brand"]
+    cp_map            = pm_lookup.set_index("asin")["cp"]
+    netsale["brand manager"] = netsale["asin"].map(brand_manager_map)
+    netsale["brand"]         = netsale["asin"].map(brand_map)
+    netsale["cp"]            = netsale["asin"].map(cp_map)
 
-        # Clean total column
-        netsale["total"] = (
-            netsale["total"]
-            .astype(str)
-            .str.replace(",", "", regex=False)
-            .astype(float)
-        )
+    # ── Step 14: Clean 'total' ────────────────────────────────────────────────
+    netsale["total"] = (
+        netsale["total"]
+        .astype(str)
+        .str.replace(",", "", regex=False)
+        .astype(float)
+    )
 
-        # Build pivot (per SKU x Order ID)
+    # ── Step 16: Pivot table ──────────────────────────────────────────────────
+    with st.spinner("Building pivot table…"):
         pivot = pd.pivot_table(
             netsale,
             index=["sku", "order id", "asin", "brand"],
@@ -79,249 +96,226 @@ if txn_file and pm_file:
                 "product sales",
                 "total sales tax liable(gst before adjusting tcs)",
                 "total",
-                "cp",
+                "cp"
             ],
-            aggfunc="sum",
+            aggfunc="sum"
         ).reset_index()
 
-        # Sales Amount (Turn Over)
-        pivot["product sales"] = pd.to_numeric(pivot["product sales"], errors="coerce")
-        pivot["total sales tax liable(gst before adjusting tcs)"] = pd.to_numeric(
-            pivot["total sales tax liable(gst before adjusting tcs)"], errors="coerce"
-        )
-        pivot["Sales Amount (Turn Over)"] = (
-            pivot["product sales"]
-            + pivot["total sales tax liable(gst before adjusting tcs)"]
-        )
+    # ── Steps 18-23: Derived columns ─────────────────────────────────────────
+    pivot["product sales"] = pd.to_numeric(pivot["product sales"], errors="coerce")
+    pivot["total sales tax liable(gst before adjusting tcs)"] = pd.to_numeric(
+        pivot["total sales tax liable(gst before adjusting tcs)"], errors="coerce"
+    )
+    # Sales Amount (Turn Over) = product sales + GST
+    # If product sales col is 0 (common in Amazon reports where it rolls into GST col),
+    # fall back to using `total` (net transferred) as the turnover basis
+    raw_turnover = (
+        pivot["product sales"] +
+        pivot["total sales tax liable(gst before adjusting tcs)"]
+    )
+    pivot["Sales Amount (Turn Over)"] = raw_turnover.where(raw_turnover != 0, pivot["total"])
+    pivot["Amazon Total Deducation"] = pivot["Sales Amount (Turn Over)"] - pivot["total"]
+    pivot["Amazon Total Deducation %"] = (
+        pivot["Amazon Total Deducation"] / pivot["Sales Amount (Turn Over)"] * 100
+    ).round(2)
+    pivot["cp"]       = pd.to_numeric(pivot["cp"], errors="coerce")
+    pivot["quantity"] = pd.to_numeric(pivot["quantity"], errors="coerce")
+    pivot["CP as per Qty"] = pivot["cp"] * pivot["quantity"]
+    pivot["Profit"]        = pivot["total"] - pivot["CP as per Qty"]
 
-        # Amazon Total Deduction
-        pivot["Amazon Total Deducation"] = (
-            pivot["Sales Amount (Turn Over)"] - pivot["total"]
-        )
-
-        # Deduction %
-        pivot["Amazon Total Deducation %"] = (
-            pivot["Amazon Total Deducation"] / pivot["Sales Amount (Turn Over)"] * 100
-        ).round(2)
-
-        # CP as per Qty
-        pivot["cp"] = pd.to_numeric(pivot["cp"], errors="coerce")
-        pivot["quantity"] = pd.to_numeric(pivot["quantity"], errors="coerce")
-        pivot["CP as per Qty"] = pivot["cp"] * pivot["quantity"]
-
-        # Profit
-        pivot["Profit"] = pivot["total"] - pivot["CP as per Qty"]
-
-        # Refund flag
-        netsale_refund = df.copy()
+    # ── Step 24-28: Load refund & flag ───────────────────────────────────────
+    with st.spinner("Loading refund data…"):
+        netsale_refund = pd.read_csv(refund_file, header=11, low_memory=False)
         netsale_refund = netsale_refund[netsale_refund["type"] == "Refund"]
-        pivot["refund"] = pivot["order id"].where(
-            pivot["order id"].isin(netsale_refund["order id"])
-        )
-
-        # Exclude refunded orders
-        netsale_refund_nan = pivot[pivot["refund"].isna()].copy()
-
-        # ── Brand pivot with exact requested column order ──────────────────────
-        brand_raw = pd.pivot_table(
-            netsale_refund_nan,
-            index="brand",
-            values=["quantity", "Sales Amount (Turn Over)", "total", "CP as per Qty", "Profit"],
-            aggfunc="sum",
-        )
-        brand_raw.loc["Grand Total"] = brand_raw.sum()
-        brand_raw = brand_raw.reset_index()
-
-        # Exact order: Brand, Quantity, Sales Amount (Turn Over), Transferred Price, CP as per Qty, Profit
-        brand_pivot = brand_raw[
-            ["brand", "quantity", "Sales Amount (Turn Over)", "total", "CP as per Qty", "Profit"]
-        ].copy()
-        brand_pivot.columns = [
-            "Brand", "Quantity", "Sales Amount (Turn Over)",
-            "Transferred Price", "CP as per Qty", "Profit"
-        ]
-
-        # ── Pivot report (order-level) ─────────────────────────────────────────
-        pivot_cols_available = [c for c in [
-            "sku", "order id", "asin", "brand", "quantity",
-            "Sales Amount (Turn Over)", "total",
-            "CP as per Qty", "Profit",
-            "Amazon Total Deducation", "Amazon Total Deducation %",
-        ] if c in netsale_refund_nan.columns]
-
-        pivot_report = netsale_refund_nan[pivot_cols_available].copy()
-        # Rename 'total' to 'Transferred Price' in pivot report too
-        pivot_report = pivot_report.rename(columns={"total": "Transferred Price"})
-
-    st.success("✅ Data processed successfully!")
-
-    # ── KPI Summary ──────────────────────────────────────────────────────────
-    st.markdown("---")
-    st.subheader("📊 Key Metrics (Excluding Refunded Orders)")
-
-    grand = brand_pivot[brand_pivot["Brand"] == "Grand Total"].iloc[0]
-    k1, k2, k3, k4, k5 = st.columns(5)
-    k1.metric("Total Qty", f"{int(grand['Quantity']):,}")
-    k2.metric("Sales Turnover", f"₹{grand['Sales Amount (Turn Over)']:,.0f}")
-    k3.metric("Transferred Price", f"₹{grand['Transferred Price']:,.0f}")
-    k4.metric("CP as per Qty", f"₹{grand['CP as per Qty']:,.0f}")
-    profit_val = grand["Profit"]
-    k5.metric("Profit / Loss", f"₹{profit_val:,.0f}")
-
-    # ── Tabs ──────────────────────────────────────────────────────────────────
-    st.markdown("---")
-    tab1, tab2 = st.tabs(["🏷️ Brand-wise Summary", "🔍 Pivot Report"])
-
-    # ═══════════════════════════════════════════════════════════════════════
-    # TAB 1 — Brand-wise Summary
-    # ═══════════════════════════════════════════════════════════════════════
-    with tab1:
-        st.subheader("Brand-wise Summary")
-        st.caption("Brand  ·  Quantity  ·  Sales Amount (Turn Over)  ·  Transferred Price  ·  CP as per Qty  ·  Profit")
-
-        brand_display = brand_pivot.copy()
-        brand_display["Quantity"] = brand_display["Quantity"].apply(lambda x: f"{x:,.0f}")
-        for col in ["Sales Amount (Turn Over)", "Transferred Price", "CP as per Qty", "Profit"]:
-            brand_display[col] = brand_display[col].apply(lambda x: f"₹{x:,.2f}")
-
-        def highlight_grand(row):
-            if row["Brand"] == "Grand Total":
-                return ["background-color: #1e3a5f; color: white; font-weight: bold"] * len(row)
-            return [""] * len(row)
-
-        def color_profit(val):
-            try:
-                num = float(str(val).replace("₹", "").replace(",", ""))
-                if num < 0:
-                    return "color: #ef4444; font-weight: bold"
-                elif num > 0:
-                    return "color: #22c55e; font-weight: bold"
-            except Exception:
-                pass
-            return ""
-
-        styled_brand = (
-            brand_display.style
-            .apply(highlight_grand, axis=1)
-            .applymap(color_profit, subset=["Profit"])
-        )
-        st.dataframe(styled_brand, use_container_width=True, hide_index=True)
-
-        buf_b = io.BytesIO()
-        with pd.ExcelWriter(buf_b, engine="openpyxl") as writer:
-            brand_pivot.to_excel(writer, sheet_name="Brand Summary", index=False)
-        st.download_button(
-            "📥 Download Brand Summary (Excel)",
-            buf_b.getvalue(),
-            file_name="brand_summary.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
-
-    # ═══════════════════════════════════════════════════════════════════════
-    # TAB 2 — Pivot Report
-    # ═══════════════════════════════════════════════════════════════════════
-    with tab2:
-        st.subheader("Pivot Report (Order-level, Refunds Excluded)")
-
-        f1, f2 = st.columns([2, 3])
-        with f1:
-            brands_list = sorted(netsale_refund_nan["brand"].dropna().unique().tolist())
-            selected_brands = st.multiselect("Filter by Brand", brands_list, default=[])
-        with f2:
-            search_val = st.text_input("Search by Order ID / SKU / ASIN")
-
-        filtered = pivot_report.copy()
-        if selected_brands:
-            filtered = filtered[filtered["brand"].isin(selected_brands)]
-        if search_val:
-            mask = (
-                filtered["order id"].astype(str).str.contains(search_val, case=False, na=False)
-                | filtered["sku"].astype(str).str.contains(search_val, case=False, na=False)
-                | filtered["asin"].astype(str).str.contains(search_val, case=False, na=False)
-            )
-            filtered = filtered[mask]
-
-        total_rows = len(filtered)
-        STYLE_ROW_LIMIT = 2000   # only apply Styler when rows are manageable
-
-        st.write(f"Showing **{total_rows:,}** orders")
-
-        fmt = {
-            "quantity": "{:,.0f}",
-            "Sales Amount (Turn Over)": "₹{:,.2f}",
-            "Transferred Price": "₹{:,.2f}",
-            "CP as per Qty": "₹{:,.2f}",
-            "Profit": "₹{:,.2f}",
-        }
-        if "Amazon Total Deducation" in filtered.columns:
-            fmt["Amazon Total Deducation"] = "₹{:,.2f}"
-        if "Amazon Total Deducation %" in filtered.columns:
-            fmt["Amazon Total Deducation %"] = "{:.2f}%"
-
-        def color_profit_num(val):
-            try:
-                if float(val) < 0:
-                    return "color: #ef4444; font-weight: bold"
-                elif float(val) > 0:
-                    return "color: #22c55e; font-weight: bold"
-            except Exception:
-                pass
-            return ""
-
-        if total_rows <= STYLE_ROW_LIMIT:
-            # Small result — full styling is safe
-            display_df = (
-                filtered.reset_index(drop=True).style
-                .applymap(color_profit_num, subset=["Profit"])
-                .format(fmt, na_rep="-")
-            )
-        else:
-            # Large result — skip Styler to avoid cell-limit crash; show plain table
-            st.info(
-                f"ℹ️ {total_rows:,} rows loaded. Use the Brand filter or search above to narrow "
-                f"results — colour highlighting activates automatically for ≤ {STYLE_ROW_LIMIT:,} rows."
-            )
-            display_df = filtered.reset_index(drop=True)
-
-        st.dataframe(display_df, use_container_width=True, height=450, hide_index=True)
-
-        buf_p = io.BytesIO()
-        with pd.ExcelWriter(buf_p, engine="openpyxl") as writer:
-            pivot_report.to_excel(writer, sheet_name="Pivot Report", index=False)
-        st.download_button(
-            "📥 Download Pivot Report (Excel)",
-            buf_p.getvalue(),
-            file_name="pivot_report.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
-
-    # ── Full Excel Export ─────────────────────────────────────────────────────
-    st.markdown("---")
-    st.subheader("⬇️ Download Full Report (Both Sheets)")
-    buf_full = io.BytesIO()
-    with pd.ExcelWriter(buf_full, engine="openpyxl") as writer:
-        brand_pivot.to_excel(writer, sheet_name="Brand Summary", index=False)
-        pivot_report.to_excel(writer, sheet_name="Pivot Report", index=False)
-    st.download_button(
-        "📥 Download Full Report (Excel)",
-        buf_full.getvalue(),
-        file_name="netsale_full_report.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    pivot["refund"] = pivot["order id"].where(
+        pivot["order id"].isin(netsale_refund["order id"])
     )
 
-else:
-    st.info("👆 Please upload both files above to get started.")
-    with st.expander("ℹ️ What does this app do?"):
-        st.markdown("""
-        This app replicates your Jupyter notebook workflow end-to-end:
+    # ── Step 30: Non-refund rows ──────────────────────────────────────────────
+    netsale_refund_nan = pivot[pivot["refund"].isna() | (pivot["refund"] == "")]
 
-        1. **Loads** the Amazon Unified Transaction CSV (skips the first 11 metadata rows)
-        2. **Filters** to `Order` type rows with non-zero product sales
-        3. **Maps ASINs** from the Product Master Excel using SKU
-        4. **Merges** Brand Manager, Brand, and Cost Price (CP) from PM
-        5. **Builds a pivot** per SKU × Order ID with turnover, deductions, and profit
-        6. **Flags refunded orders** and excludes them from the final summary
-        7. **Brand-wise Summary** — Brand · Quantity · Sales Amount (Turn Over) · Transferred Price · CP as per Qty · Profit
-        8. **Pivot Report** — order-level detail with filters by Brand / Order ID / SKU / ASIN
-        9. Lets you **download** both reports individually or as a full Excel workbook
+    # ── Step 32-33: Brand pivot ───────────────────────────────────────────────
+    brand_pivot = pd.pivot_table(
+        netsale_refund_nan,
+        index="brand",
+        values=["quantity", "Sales Amount (Turn Over)", "total", "CP as per Qty", "Profit"],
+        aggfunc="sum"
+    )
+    brand_pivot.loc["Grand Total"] = brand_pivot.sum()
+    brand_pivot = brand_pivot.reset_index()
+    brand_pivot["quantity"] = brand_pivot["quantity"].astype(int)
+    # Apply correct column order: Brand, quantity, Sales Amount (Turn Over), total, CP as per Qty, Profit
+    brand_pivot = brand_pivot[["brand", "quantity", "Sales Amount (Turn Over)", "total", "CP as per Qty", "Profit"]]
+
+    # ════════════════════════════════════════════════════════════════════════
+    # DISPLAY
+    # ════════════════════════════════════════════════════════════════════════
+
+    st.success(f"✅ Data loaded — {len(netsale):,} orders | {len(netsale_refund):,} refunds")
+
+    # ── KPI Cards ────────────────────────────────────────────────────────────
+    grand = brand_pivot[brand_pivot["brand"] == "Grand Total"].iloc[0]
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Total Quantity", f"{int(grand['quantity']):,}")
+    c2.metric("Sales Amount (Turn Over)", fmt(grand["Sales Amount (Turn Over)"]))
+    c3.metric("Transferred Price", fmt(grand["total"]))
+    c4.metric("CP as per Qty", fmt(grand["CP as per Qty"]))
+    profit_val = grand["Profit"]
+    c5.metric("P&L", fmt(profit_val), delta=None)
+
+    st.divider()
+
+    # ── Tabs ─────────────────────────────────────────────────────────────────
+    tab1, tab2, tab3 = st.tabs(["📊 Brand Summary", "🔍 Order Detail", "↩️ Refund Orders"])
+
+    # ── Tab 1: Brand Summary ─────────────────────────────────────────────────
+    with tab1:
+        st.subheader("Brand-wise Summary (excluding refunded orders)")
+
+        # Filter controls
+        col_f1, col_f2 = st.columns([3, 1])
+        with col_f1:
+            brands_list = brand_pivot[brand_pivot["brand"] != "Grand Total"]["brand"].tolist()
+            selected_brands = st.multiselect("Filter by Brand", brands_list, default=brands_list)
+        with col_f2:
+            show_grand = st.checkbox("Show Grand Total row", value=True)
+
+        display_bp = brand_pivot[
+            (brand_pivot["brand"].isin(selected_brands)) |
+            (brand_pivot["brand"] == "Grand Total" if show_grand else False)
+        ].copy()
+
+        # Rename for display — exact column order: Brand, quantity, Sales Amount (Turn Over), Transferred Price, CP as per Qty, P&L
+        display_bp = display_bp.rename(columns={
+            "brand": "Brand",
+            "quantity": "quantity",
+            "Sales Amount (Turn Over)": "Sales Amount (Turn Over)",
+            "total": "Transferred Price",
+            "CP as per Qty": "CP as per Qty",
+            "Profit": "P&L"
+        })
+        # Enforce column order
+        display_bp = display_bp[["Brand", "quantity", "Sales Amount (Turn Over)", "Transferred Price", "CP as per Qty", "P&L"]]
+
+        styled = (
+            display_bp.style
+            .map(highlight_profit, subset=["P&L"])
+            .format({
+                "Sales Amount (Turn Over)": "₹{:,.2f}",
+                "Transferred Price": "₹{:,.2f}",
+                "CP as per Qty": "₹{:,.2f}",
+                "P&L": "₹{:,.2f}",
+                "quantity": "{:,}"
+            })
+        )
+        st.dataframe(styled, use_container_width=True, hide_index=True)
+
+        # Download
+        buf = io.BytesIO()
+        display_bp.to_excel(buf, index=False)
+        st.download_button(
+            "⬇️ Download Brand Summary (Excel)",
+            data=buf.getvalue(),
+            file_name="brand_summary.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+
+    # ── Tab 2: Order Detail ──────────────────────────────────────────────────
+    with tab2:
+        st.subheader("Order-level Detail (pivot, no refunds)")
+
+        col_s1, col_s2, col_s3 = st.columns(3)
+        with col_s1:
+            brand_filter = st.multiselect(
+                "Brand",
+                options=sorted(netsale_refund_nan["brand"].dropna().unique()),
+                key="detail_brand"
+            )
+        with col_s2:
+            sku_filter = st.text_input("SKU contains", key="detail_sku")
+        with col_s3:
+            asin_filter = st.text_input("ASIN contains", key="detail_asin")
+
+        detail = netsale_refund_nan.copy()
+        if brand_filter:
+            detail = detail[detail["brand"].isin(brand_filter)]
+        if sku_filter:
+            detail = detail[detail["sku"].str.contains(sku_filter, case=False, na=False)]
+        if asin_filter:
+            detail = detail[detail["asin"].str.contains(asin_filter, case=False, na=False)]
+
+        cols_show = ["sku", "order id", "asin", "brand", "quantity",
+                     "total", "CP as per Qty", "Profit", "Sales Amount (Turn Over)",
+                     "Amazon Total Deducation %"]
+        detail_show = detail[[c for c in cols_show if c in detail.columns]]
+
+        MAX_STYLE_CELLS = 2_000_000
+        if detail_show.size <= MAX_STYLE_CELLS:
+            rendered = (
+                detail_show.style
+                .map(highlight_profit, subset=["Profit"])
+                .format({
+                    "total": "₹{:,.2f}",
+                    "CP as per Qty": "₹{:,.2f}",
+                    "Profit": "₹{:,.2f}",
+                    "Sales Amount (Turn Over)": "₹{:,.2f}",
+                    "Amazon Total Deducation %": "{:.2f}%"
+                }, na_rep="—")
+            )
+        else:
+            st.warning(
+                f"Table has {detail_show.size:,} cells — showing without colour styling. "
+                "Use the filters above to narrow results."
+            )
+            rendered = detail_show
+        st.dataframe(rendered, use_container_width=True, height=450)
+        st.caption(f"Showing {len(detail_show):,} rows")
+
+        buf2 = io.BytesIO()
+        detail_show.to_excel(buf2, index=False)
+        st.download_button(
+            "⬇️ Download Filtered Orders (Excel)",
+            data=buf2.getvalue(),
+            file_name="order_detail.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+
+    # ── Tab 3: Refund Orders ─────────────────────────────────────────────────
+    with tab3:
+        st.subheader("Orders with Refunds")
+
+        refunded = pivot[pivot["refund"].notna() & (pivot["refund"] != "")].copy()
+        refunded_show = refunded[["sku", "order id", "asin", "brand",
+                                   "quantity", "total", "Profit", "refund"]].copy()
+        refunded_show = refunded_show.rename(columns={"refund": "Refund Order ID"})
+
+        st.dataframe(
+            refunded_show.style.format({
+                "total": "₹{:,.2f}",
+                "Profit": "₹{:,.2f}"
+            }, na_rep="—"),
+            use_container_width=True,
+            height=400
+        )
+        st.caption(f"{len(refunded_show):,} orders have matching refunds")
+
+        buf3 = io.BytesIO()
+        refunded_show.to_excel(buf3, index=False)
+        st.download_button(
+            "⬇️ Download Refund Orders (Excel)",
+            data=buf3.getvalue(),
+            file_name="refund_orders.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+
+else:
+    st.info("👈 Please upload all three files in the sidebar to get started.")
+
+    with st.expander("ℹ️ Expected file formats"):
+        st.markdown("""
+| File | Format | Notes |
+|---|---|---|
+| **Transaction CSV** | `.csv` | Amazon Unified Transaction report; actual data starts at row 12 |
+| **PM Excel** | `.xlsx` | Columns needed: col 0 = Amazon SKU Name, col 4 = Brand Manager, col 6 = Brand, col 9 = CP |
+| **Refund CSV** | `.csv` | Same format as Transaction CSV; can be a wider date-range file |
         """)
